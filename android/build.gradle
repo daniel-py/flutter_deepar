@@ -12,7 +12,9 @@ buildscript {
     }
 }
 
-allprojects {
+// Inject DeepAR Maven repo into the root project so transitive
+// dependencies resolve in the host app's classpath, not just this plugin.
+rootProject.allprojects {
     repositories {
         google()
         mavenCentral()

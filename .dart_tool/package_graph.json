@@ -5,7 +5,7 @@
   "packages": [
     {
       "name": "flutter_deepar",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "dependencies": [
         "flutter"
       ],
@@ -24,13 +24,13 @@
       ]
     },
     {
-      "name": "vector_math",
-      "version": "2.2.0",
+      "name": "sky_engine",
+      "version": "0.0.0",
       "dependencies": []
     },
     {
-      "name": "sky_engine",
-      "version": "0.0.0",
+      "name": "vector_math",
+      "version": "2.2.0",
       "dependencies": []
     },
     {
