@@ -158,7 +158,15 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     // ──────────────────────────────────────────────────────────────────────
     //  Initialize DeepAR SDK
+    //  NOTE: DeepAR's initialize() is asynchronous — the initialized()
+    //  callback fires when the engine is truly ready.  We hold the
+    //  MethodChannel.Result until that callback so the Dart side doesn't
+    //  call startCapture on an engine that hasn't finished setup.
+    //  In release builds (AOT) Dart runs fast enough to hit this race.
     // ──────────────────────────────────────────────────────────────────────
+
+    // Pending init result — held until DeepAR's initialized() fires
+    private var pendingInitResult: MethodChannel.Result? = null
 
     private fun initializeDeepAR(licenseKey: String, result: MethodChannel.Result) {
         val ctx = applicationContext ?: run {
@@ -168,6 +176,9 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         try {
             Log.d(TAG, "Initializing DeepAR SDK...")
+
+            // Hold the result — we'll complete it in initialized()
+            pendingInitResult = result
 
             deepAR = DeepAR(ctx)
             deepAR?.setLicenseKey(licenseKey)
@@ -181,8 +192,13 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     Log.d(TAG, "DeepAR shutdown finished")
                 }
                 override fun initialized() {
-                    Log.d(TAG, "DeepAR SDK initialized callback")
+                    Log.d(TAG, "DeepAR SDK initialized callback — engine is ready")
                     isSdkInitialized = true
+                    // Complete the pending init result now that the engine is truly ready
+                    mainHandler.post {
+                        pendingInitResult?.success(true)
+                        pendingInitResult = null
+                    }
                 }
                 override fun faceVisibilityChanged(visible: Boolean) {}
                 override fun imageVisibilityChanged(gameObjectName: String?, visible: Boolean) {}
@@ -206,12 +222,22 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             // Output is portrait (720x1280) since the camera frame is rotated 270°.
             deepAR?.setOffscreenRendering(outputWidth, outputHeight, DeepARPixelFormat.RGBA_8888)
 
-            isSdkInitialized = true
             nativeFrameCount = 0
-            Log.d(TAG, "DeepAR init complete (offscreen ${outputWidth}x${outputHeight})")
-            result.success(true)
+            Log.d(TAG, "DeepAR init dispatched (offscreen ${outputWidth}x${outputHeight}), waiting for initialized() callback...")
+
+            // Safety timeout: if initialized() never fires within 5s, resolve anyway
+            // so the Dart side isn't stuck waiting forever.
+            mainHandler.postDelayed({
+                if (pendingInitResult != null) {
+                    Log.w(TAG, "Init timeout — resolving pending result")
+                    isSdkInitialized = true
+                    pendingInitResult?.success(true)
+                    pendingInitResult = null
+                }
+            }, 5000)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize DeepAR: ${e.message}", e)
+            pendingInitResult = null
             result.error("INIT_FAILED", e.message, e.stackTraceToString())
         }
     }
@@ -315,6 +341,7 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         isSdkInitialized = false
         nativeFrameCount = 0
         frameEventSink = null
+        pendingInitResult = null
     }
 
     // ──────────────────────────────────────────────────────────────────────

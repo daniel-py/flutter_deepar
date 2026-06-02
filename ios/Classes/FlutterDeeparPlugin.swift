@@ -25,6 +25,9 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
     private var nativeFrameCount = 0
     private let sessionQueue = DispatchQueue(label: "com.deepar.flutter_deepar.session")
 
+    // Pending init result — held until DeepAR's didInitialize fires
+    private var pendingInitResult: FlutterResult?
+
     // ──────────────────────────────────────────────────────────────────────
     //  Plugin registration
     // ──────────────────────────────────────────────────────────────────────
@@ -94,6 +97,11 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
 
     // ──────────────────────────────────────────────────────────────────────
     //  Initialize DeepAR SDK
+    //  NOTE: DeepAR's initializeOffscreen is asynchronous.  We hold the
+    //  FlutterResult until the `didInitialize` delegate callback fires so
+    //  the Dart side doesn't call startCapture on an engine that hasn't
+    //  finished setup yet.  In release builds (AOT) the Dart code runs
+    //  fast enough to hit this race condition consistently.
     // ──────────────────────────────────────────────────────────────────────
 
     private func initializeDeepAR(licenseKey: String, result: @escaping FlutterResult) {
@@ -105,12 +113,23 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
         // Disable live mode and initialize off-screen rendering.
         // Output is portrait 720x1280 (AVFoundation handles rotation via connection.videoOrientation).
         deepAR?.changeLiveMode(false)
+
+        nativeFrameCount = 0
+
+        // Hold the result — we'll complete it in didInitialize()
+        pendingInitResult = result
+
         deepAR?.initializeOffscreen(withWidth: 720, height: 1280)
 
-        isSdkInitialized = true
-        nativeFrameCount = 0
-        NSLog("[FlutterDeepAR] DeepAR SDK initialized successfully")
-        result(true)
+        // Safety timeout: if didInitialize never fires within 5s, resolve anyway
+        // so the Dart side isn't stuck waiting forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            guard let self = self, let pending = self.pendingInitResult else { return }
+            NSLog("[FlutterDeepAR] Init timeout — resolving pending result")
+            self.isSdkInitialized = true
+            self.pendingInitResult = nil
+            pending(true)
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -195,6 +214,7 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
         deepAR?.shutdown()
         deepAR = nil
         isSdkInitialized = false
+        pendingInitResult = nil
         NSLog("[FlutterDeepAR] Pipeline destroyed")
         result(true)
     }
@@ -267,7 +287,13 @@ extension FlutterDeeparPlugin: DeepARDelegate {
     public func recordingFailedWithError(_ error: Error!) {}
     public func didTakeScreenshot(_ screenshot: UIImage!) {}
     public func didInitialize() {
-        NSLog("[FlutterDeepAR] DeepAR didInitialize callback")
+        NSLog("[FlutterDeepAR] DeepAR didInitialize callback — engine is ready")
+        isSdkInitialized = true
+        // Complete the pending init result now that the engine is truly ready
+        if let pending = pendingInitResult {
+            pendingInitResult = nil
+            pending(true)
+        }
     }
     public func faceVisiblityDidChange(_ visible: Bool) {}
     public func didFinishShutdown() {
