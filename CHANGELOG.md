@@ -1,3 +1,8 @@
+## 0.1.2
+
+* Fix: Resolved a race condition on iOS and Android where `startCapture` could crash in release mode due to asynchronous engine initialization.
+* Fix: Added ProGuard rules to prevent DeepAR classes from being stripped by R8 during release builds on Android.
+
 ## 0.1.1
 
 * Fix: DeepAR Maven repository now injects into root project so consuming apps can resolve `ai.deepar.ar:DeepAR` without manual repo setup
