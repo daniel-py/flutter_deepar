@@ -5,7 +5,7 @@
   "packages": [
     {
       "name": "flutter_deepar",
-      "version": "0.1.1",
+      "version": "0.1.3",
       "dependencies": [
         "flutter"
       ],
@@ -35,12 +35,12 @@
     },
     {
       "name": "meta",
-      "version": "1.16.0",
+      "version": "1.17.0",
       "dependencies": []
     },
     {
       "name": "material_color_utilities",
-      "version": "0.11.1",
+      "version": "0.13.0",
       "dependencies": [
         "collection"
       ]
@@ -52,7 +52,7 @@
     },
     {
       "name": "characters",
-      "version": "1.4.0",
+      "version": "1.4.1",
       "dependencies": []
     }
   ],

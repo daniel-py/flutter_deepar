@@ -9,6 +9,7 @@ import android.hardware.camera2.*
 import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.ActivityCompat
@@ -45,17 +46,30 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     // Flutter bindings
     private var methodChannel: MethodChannel? = null
     private var eventChannel: EventChannel? = null
-    private var frameEventSink: EventChannel.EventSink? = null
+    @Volatile private var frameEventSink: EventChannel.EventSink? = null
     private var applicationContext: Context? = null
     private var activity: Activity? = null
 
     // DeepAR engine
     private var deepAR: DeepAR? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var isSdkInitialized = false
-    private var isCapturing = false
+    // These flags are written/read across the main, camera, and DeepAR render
+    // threads. They MUST be @Volatile — without it the ART AOT optimizer in
+    // release builds can cache the value in a worker thread and never observe
+    // updates (e.g. the DeepAR render thread never sees isCapturing flip),
+    // which manifests as a blank preview that only reproduces in release.
+    @Volatile private var isSdkInitialized = false
+    @Volatile private var isCapturing = false
     private var nativeFrameCount = 0
     private var isFrontCamera = true
+
+    // Dedicated background thread for camera capture + frame conversion.
+    // All Camera2 callbacks and the heavy YUV->NV21 conversion run here so the
+    // main/UI thread stays free to composite the host's preview surface. Running
+    // this work on the main thread saturates it in release builds (where Dart
+    // pushes frames faster) and the preview never gets drawn.
+    private var cameraThread: HandlerThread? = null
+    private var cameraHandler: Handler? = null
 
     // Camera2 API
     private var cameraDevice: CameraDevice? = null
@@ -251,6 +265,7 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             Log.d(TAG, "startCapture: initialized=$isSdkInitialized")
             isCapturing = true
             nativeFrameCount = 0
+            startCameraThread()
             openCamera(isFrontCamera)
             result.success(true)
         } catch (e: Exception) {
@@ -268,6 +283,7 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             Log.d(TAG, "Stopping capture...")
             isCapturing = false
             closeCamera()
+            stopCameraThread()
             Log.d(TAG, "Capture stopped")
             result.success(true)
         } catch (e: Exception) {
@@ -332,6 +348,7 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     private fun cleanup() {
         isCapturing = false
         closeCamera()
+        stopCameraThread()
         try {
             deepAR?.release()
         } catch (e: Exception) {
@@ -348,8 +365,30 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     //  Camera2 API — open camera, feed YUV frames to DeepAR
     // ──────────────────────────────────────────────────────────────────────
 
+    private fun startCameraThread() {
+        if (cameraThread != null) return
+        cameraThread = HandlerThread("DeepARCamera").also { it.start() }
+        cameraHandler = Handler(cameraThread!!.looper)
+        Log.d(TAG, "Camera background thread started")
+    }
+
+    private fun stopCameraThread() {
+        cameraThread?.quitSafely()
+        try {
+            cameraThread?.join(500)
+        } catch (e: InterruptedException) {
+            Log.w(TAG, "Interrupted while stopping camera thread: ${e.message}")
+        }
+        cameraThread = null
+        cameraHandler = null
+    }
+
     private fun openCamera(front: Boolean) {
         val manager = cameraManager ?: return
+        // Ensure the background thread exists (e.g. if openCamera is reached
+        // via switchCamera without a fresh startCapture).
+        if (cameraHandler == null) startCameraThread()
+        val camHandler = cameraHandler ?: return
         val cameraId = getCameraId(front) ?: return
         val ctx = activity ?: applicationContext ?: return
 
@@ -366,7 +405,13 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             ImageFormat.YUV_420_888, 4
         )
         imageReader?.setOnImageAvailableListener({ reader ->
-            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            // acquireLatestImage can throw if the reader was closed on the main
+            // thread (closeCamera) while this background callback is in flight.
+            val image = try {
+                reader.acquireLatestImage()
+            } catch (e: IllegalStateException) {
+                return@setOnImageAvailableListener
+            } ?: return@setOnImageAvailableListener
             try {
                 if (!isCapturing) return@setOnImageAvailableListener
 
@@ -428,7 +473,7 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             } finally {
                 image.close()
             }
-        }, mainHandler)
+        }, camHandler)
 
         manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
@@ -446,12 +491,13 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 camera.close()
                 cameraDevice = null
             }
-        }, mainHandler)
+        }, camHandler)
     }
 
     private fun startCameraPreview() {
         val camera = cameraDevice ?: return
         val reader = imageReader ?: return
+        val camHandler = cameraHandler ?: mainHandler
 
         try {
             val captureRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
@@ -471,7 +517,7 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             session.setRepeatingRequest(
                                 captureRequestBuilder.build(),
                                 null,
-                                mainHandler
+                                camHandler
                             )
                         } catch (e: Exception) {
                             Log.e(TAG, "Failed to start repeating request: ${e.message}")
@@ -481,7 +527,7 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         Log.e(TAG, "Camera capture session configuration failed")
                     }
                 },
-                mainHandler
+                camHandler
             )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create camera preview: ${e.message}", e)
