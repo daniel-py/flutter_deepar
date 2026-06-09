@@ -1,3 +1,7 @@
+## 0.1.4
+
+* Fix (Android): `receiveFrame` is called on the main thread again. DeepAR is single-threaded and requires every call on the thread it was initialized on; 0.1.3 moved `receiveFrame` to the background camera thread, which made DeepAR reject every frame ("Method called from the thread that DeepAR was not initialized in") and broke the preview in debug too. Only the heavy YUV→NV21 conversion now runs on the background thread; the converted buffer is handed back to the main thread for `receiveFrame`.
+
 ## 0.1.3
 
 * Fix (Android): Camera capture and the YUV→NV21 conversion now run on a dedicated background thread instead of the main/UI thread. On the main thread they saturated it in release (AOT) builds, starving the host's preview surface compositor and producing a blank (white/black) preview that only reproduced in release. iOS already used a background queue.

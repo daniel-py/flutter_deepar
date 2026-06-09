@@ -460,14 +460,25 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 frameBuffer.put(nv21)
                 frameBuffer.rewind()
 
-                deepAR?.receiveFrame(
-                    frameBuffer,
-                    width, height,
-                    if (front) 270 else 90,
-                    front,
-                    DeepARImageFormat.YUV_420_888,
-                    width
-                )
+                val rotation = if (front) 270 else 90
+                // DeepAR is single-threaded: receiveFrame MUST run on the thread
+                // DeepAR was initialized on (the main thread). Only the heavy
+                // YUV->NV21 conversion above runs on the background camera thread.
+                mainHandler.post {
+                    if (!isCapturing) return@post
+                    try {
+                        deepAR?.receiveFrame(
+                            frameBuffer,
+                            width, height,
+                            rotation,
+                            front,
+                            DeepARImageFormat.YUV_420_888,
+                            width
+                        )
+                    } catch (e: Exception) {
+                        Log.w(TAG, "receiveFrame error: ${e.message}")
+                    }
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Frame processing error: ${e.message}")
             } finally {
