@@ -1,3 +1,7 @@
+## 0.1.7
+
+* Fix (iOS): frames are now delivered with tightly packed rows. `CVPixelBuffer` pads each row to a 64-byte alignment; the plugin previously shipped the padding while reporting the unpadded width, which sheared the image diagonally for any output width where `width * 4` is not 64-aligned (e.g. the 540x960 configurable resolution added in 0.1.6 — the 720x1280 default was 64-aligned by luck and unaffected). Android already stripped row padding and is unchanged.
+
 ## 0.1.6
 
 * Feature: `initialize()` accepts optional `outputWidth`/`outputHeight` (default 720x1280) to configure the DeepAR offscreen render resolution on both platforms. Matching them to your video encoder's resolution avoids downstream rescaling and shrinks per-frame transfer cost (e.g. 540x960 cuts RGBA frame size ~45% vs the default). Fully backward compatible.

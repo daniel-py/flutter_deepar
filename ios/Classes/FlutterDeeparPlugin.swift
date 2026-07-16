@@ -318,12 +318,29 @@ extension FlutterDeeparPlugin: DeepARDelegate {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let totalBytes = bytesPerRow * height
+        let tightRowBytes = width * 4
 
-        let data = FlutterStandardTypedData(bytes: Data(bytes: baseAddress, count: totalBytes))
+        // CVPixelBuffer pads each row to a 64-byte alignment, but consumers
+        // treat the payload as tightly packed width*4 rows — shipping the
+        // padding shears the image diagonally. 720-wide output hid this
+        // (2880 bytes is already 64-aligned); other widths (e.g. 540) expose
+        // it, so strip the padding row by row when present.
+        let frameBytes: Data
+        if bytesPerRow == tightRowBytes {
+            frameBytes = Data(bytes: baseAddress, count: tightRowBytes * height)
+        } else {
+            var tight = Data(capacity: tightRowBytes * height)
+            let src = baseAddress.assumingMemoryBound(to: UInt8.self)
+            for row in 0..<height {
+                tight.append(src.advanced(by: row * bytesPerRow), count: tightRowBytes)
+            }
+            frameBytes = tight
+        }
+
+        let data = FlutterStandardTypedData(bytes: frameBytes)
 
         if nativeFrameCount <= 3 || nativeFrameCount % 200 == 0 {
-            NSLog("[FlutterDeepAR] Frame #\(nativeFrameCount): \(width)x\(height), bytes=\(totalBytes)")
+            NSLog("[FlutterDeepAR] Frame #\(nativeFrameCount): \(width)x\(height), bytes=\(frameBytes.count), rowPadding=\(bytesPerRow - tightRowBytes)")
         }
 
         DispatchQueue.main.async {
