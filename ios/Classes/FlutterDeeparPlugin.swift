@@ -78,7 +78,9 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
                 result(FlutterError(code: "INVALID_ARG", message: "License key is required", details: nil))
                 return
             }
-            initializeDeepAR(licenseKey: licenseKey, result: result)
+            let outputWidth = args["outputWidth"] as? Int ?? 720
+            let outputHeight = args["outputHeight"] as? Int ?? 1280
+            initializeDeepAR(licenseKey: licenseKey, outputWidth: outputWidth, outputHeight: outputHeight, result: result)
         case "startCapture":
             startCapture(result: result)
         case "stopCapture":
@@ -104,14 +106,15 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
     //  fast enough to hit this race condition consistently.
     // ──────────────────────────────────────────────────────────────────────
 
-    private func initializeDeepAR(licenseKey: String, result: @escaping FlutterResult) {
-        NSLog("[FlutterDeepAR] Initializing DeepAR SDK...")
+    private func initializeDeepAR(licenseKey: String, outputWidth: Int, outputHeight: Int, result: @escaping FlutterResult) {
+        NSLog("[FlutterDeepAR] Initializing DeepAR SDK (offscreen \(outputWidth)x\(outputHeight))...")
 
         deepAR = DeepAR()
         deepAR?.setLicenseKey(licenseKey)
         deepAR?.delegate = self
         // Disable live mode and initialize off-screen rendering.
-        // Output is portrait 720x1280 (AVFoundation handles rotation via connection.videoOrientation).
+        // Output is portrait, dimensions configurable from Dart (AVFoundation
+        // handles rotation via connection.videoOrientation).
         deepAR?.changeLiveMode(false)
 
         nativeFrameCount = 0
@@ -119,7 +122,7 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
         // Hold the result — we'll complete it in didInitialize()
         pendingInitResult = result
 
-        deepAR?.initializeOffscreen(withWidth: 720, height: 1280)
+        deepAR?.initializeOffscreen(withWidth: outputWidth, height: outputHeight)
 
         // Safety timeout: if didInitialize never fires within 5s, resolve anyway
         // so the Dart side isn't stuck waiting forever.

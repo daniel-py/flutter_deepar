@@ -1,3 +1,7 @@
+## 0.1.6
+
+* Feature: `initialize()` accepts optional `outputWidth`/`outputHeight` (default 720x1280) to configure the DeepAR offscreen render resolution on both platforms. Matching them to your video encoder's resolution avoids downstream rescaling and shrinks per-frame transfer cost (e.g. 540x960 cuts RGBA frame size ~45% vs the default). Fully backward compatible.
+
 ## 0.1.5
 
 * Perf (Android): Frame dropping (backpressure) on both pipeline stages. At most one frame is now in flight for DeepAR ingest and one for EventChannel delivery; when the main thread falls behind, newer camera frames are dropped instead of queued. Previously, main-thread posts accumulated without bound under load, so latency and memory grew until the stream visibly lagged. This matches iOS, which always had `alwaysDiscardsLateVideoFrames` and never showed the problem.

@@ -111,10 +111,12 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     private val cameraWidth = 1280
     private val cameraHeight = 720
 
-    // DeepAR offscreen output must be portrait (720x1280) to match
-    // the rotated frame orientation that consumers expect.
-    private val outputWidth = 720
-    private val outputHeight = 1280
+    // DeepAR offscreen output must be portrait (width < height) to match the
+    // rotated frame orientation consumers expect. Configurable from Dart via
+    // initializeDeepAR so apps can match their encoder resolution and shrink
+    // per-frame transfer cost; defaults preserve pre-0.1.6 behaviour.
+    private var outputWidth = 720
+    private var outputHeight = 1280
 
     // ──────────────────────────────────────────────────────────────────────
     //  FlutterPlugin lifecycle
@@ -185,6 +187,8 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     result.error("INVALID_ARG", "License key is required", null)
                     return
                 }
+                outputWidth = call.argument<Int>("outputWidth") ?: 720
+                outputHeight = call.argument<Int>("outputHeight") ?: 1280
                 initializeDeepAR(licenseKey, result)
             }
             "startCapture" -> startCapture(result)
@@ -262,7 +266,7 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             })
 
             // Enable off-screen rendering so frameAvailable callback fires.
-            // Output is portrait (720x1280) since the camera frame is rotated 270°.
+            // Output is portrait since the camera frame is rotated 270°.
             deepAR?.setOffscreenRendering(outputWidth, outputHeight, DeepARPixelFormat.RGBA_8888)
 
             nativeFrameCount = 0

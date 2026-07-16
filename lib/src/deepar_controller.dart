@@ -38,10 +38,24 @@ class DeepARController {
   ///
   /// Must be called before any other method. Returns `true` if successful.
   /// Get your license key from https://developer.deepar.ai
-  Future<bool> initialize({required String licenseKey}) async {
+  ///
+  /// [outputWidth]/[outputHeight] set the offscreen render resolution of the
+  /// processed frames delivered on [frameStream] (portrait, width < height).
+  /// Match them to your video encoder's resolution to avoid downstream
+  /// rescaling and to shrink per-frame transfer cost — e.g. 540x960 for a
+  /// 540p pipeline. Defaults to 720x1280.
+  Future<bool> initialize({
+    required String licenseKey,
+    int outputWidth = 720,
+    int outputHeight = 1280,
+  }) async {
     final result = await _channel.invokeMethod<bool>(
       'initializeDeepAR',
-      {'licenseKey': licenseKey},
+      {
+        'licenseKey': licenseKey,
+        'outputWidth': outputWidth,
+        'outputHeight': outputHeight,
+      },
     );
     _initialized = result ?? false;
     return _initialized;
