@@ -20,6 +20,7 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 
 import ai.deepar.ar.ARErrorType
 import ai.deepar.ar.AREventListener
@@ -70,6 +71,34 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     // pushes frames faster) and the preview never gets drawn.
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
+
+    // Backpressure gates — at most ONE frame in flight per stage. When the
+    // main thread can't keep up (it runs both DeepAR ingest and EventChannel
+    // serialization), newer frames are DROPPED instead of queued. Without
+    // this, main-thread posts piled up without bound under load: latency
+    // snowballed and the heap ballooned. iOS never had the problem because
+    // AVFoundation drops late frames (alwaysDiscardsLateVideoFrames).
+    private val ingestInFlight = AtomicBoolean(false)
+    private val sendInFlight = AtomicBoolean(false)
+
+    // Reused frame buffers, sized on first frame. Allocating fresh multi-MB
+    // arrays per frame (~200MB/s at 30fps) kept ART's GC constantly running.
+    // Reuse is safe because the in-flight gates above guarantee a buffer is
+    // never refilled before its consumer is done with it. Two rotating direct
+    // buffers for DeepAR ingest mirror DeepAR's own Android sample.
+    private var nv21Bytes: ByteArray? = null
+    private var ingestBuffers: Array<ByteBuffer>? = null
+    private var ingestBufferIndex = 0
+    private var rgbaBytes: ByteArray? = null
+    private var uvRowV: ByteArray? = null
+    private var uvRowU: ByteArray? = null
+
+    // Whether this camera session's U/V planes alias one NV21-ordered (VU)
+    // interleaved buffer, making the bulk chroma copy valid. Checked once per
+    // session (the layout is fixed per device+session); null = not yet checked.
+    // @Volatile because it is reset on the main thread (openCamera) and used
+    // on the camera thread.
+    @Volatile private var uvPlanesAreNV21: Boolean? = null
 
     // Camera2 API
     private var cameraDevice: CameraDevice? = null
@@ -359,6 +388,13 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         nativeFrameCount = 0
         frameEventSink = null
         pendingInitResult = null
+        ingestInFlight.set(false)
+        sendInFlight.set(false)
+        nv21Bytes = null
+        ingestBuffers = null
+        rgbaBytes = null
+        uvRowV = null
+        uvRowU = null
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -399,6 +435,9 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             return
         }
 
+        // New session — the chroma layout must be re-checked on its first frame.
+        uvPlanesAreNV21 = null
+
         // ImageReader with 4 buffers to prevent "Unable to acquire buffer" warnings
         imageReader = ImageReader.newInstance(
             cameraWidth, cameraHeight,
@@ -415,69 +454,147 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             try {
                 if (!isCapturing) return@setOnImageAvailableListener
 
-                // Convert YUV_420_888 to tightly packed NV21 byte array to guarantee
-                // correct chroma interleaving across all Android devices.
-                val width = image.width
-                val height = image.height
-                val nv21 = ByteArray(width * height * 3 / 2)
-
-                val yPlane = image.planes[0]
-                val uPlane = image.planes[1]
-                val vPlane = image.planes[2]
-
-                val yBuffer = yPlane.buffer
-                val uBuffer = uPlane.buffer
-                val vBuffer = vPlane.buffer
-
-                val yRowStride = yPlane.rowStride
-                val uvRowStride = uPlane.rowStride
-                val uvPixelStride = uPlane.pixelStride
-
-                // Copy Y plane
-                var pos = 0
-                if (yRowStride == width) {
-                    yBuffer.position(0)
-                    yBuffer.get(nv21, 0, width * height)
-                    pos += width * height
-                } else {
-                    for (row in 0 until height) {
-                        yBuffer.position(row * yRowStride)
-                        yBuffer.get(nv21, pos, width)
-                        pos += width
-                    }
+                // Drop the frame BEFORE paying for conversion if the main
+                // thread hasn't consumed the previous one yet.
+                if (!ingestInFlight.compareAndSet(false, true)) {
+                    return@setOnImageAvailableListener
                 }
 
-                // Copy UV planes (V then U for NV21)
-                for (row in 0 until height / 2) {
-                    for (col in 0 until width / 2) {
-                        val uvOffset = row * uvRowStride + col * uvPixelStride
-                        nv21[pos++] = vBuffer.get(uvOffset)
-                        nv21[pos++] = uBuffer.get(uvOffset)
+                var posted = false
+                try {
+                    // Convert YUV_420_888 to tightly packed NV21 to guarantee
+                    // correct chroma interleaving across all Android devices.
+                    val width = image.width
+                    val height = image.height
+                    val nv21Size = width * height * 3 / 2
+
+                    var nv21 = nv21Bytes
+                    if (nv21 == null || nv21.size != nv21Size) {
+                        nv21 = ByteArray(nv21Size)
+                        nv21Bytes = nv21
                     }
-                }
 
-                val frameBuffer = ByteBuffer.allocateDirect(nv21.size)
-                frameBuffer.put(nv21)
-                frameBuffer.rewind()
+                    val yPlane = image.planes[0]
+                    val uPlane = image.planes[1]
+                    val vPlane = image.planes[2]
 
-                val rotation = if (front) 270 else 90
-                // DeepAR is single-threaded: receiveFrame MUST run on the thread
-                // DeepAR was initialized on (the main thread). Only the heavy
-                // YUV->NV21 conversion above runs on the background camera thread.
-                mainHandler.post {
-                    if (!isCapturing) return@post
-                    try {
-                        deepAR?.receiveFrame(
-                            frameBuffer,
-                            width, height,
-                            rotation,
-                            front,
-                            DeepARImageFormat.YUV_420_888,
-                            width
+                    val yBuffer = yPlane.buffer
+                    val uBuffer = uPlane.buffer
+                    val vBuffer = vPlane.buffer
+
+                    val yRowStride = yPlane.rowStride
+                    val uvRowStride = uPlane.rowStride
+                    val uvPixelStride = uPlane.pixelStride
+
+                    // Copy Y plane
+                    var pos = 0
+                    if (yRowStride == width) {
+                        yBuffer.position(0)
+                        yBuffer.get(nv21, 0, width * height)
+                        pos += width * height
+                    } else {
+                        for (row in 0 until height) {
+                            yBuffer.position(row * yRowStride)
+                            yBuffer.get(nv21, pos, width)
+                            pos += width
+                        }
+                    }
+
+                    // Chroma → NV21 (VU interleaved)
+                    var bulkChroma = false
+                    if (uvPixelStride == 2 && uvRowStride == width) {
+                        var aliased = uvPlanesAreNV21
+                        if (aliased == null) {
+                            aliased = checkUvPlanesAreNV21(uBuffer, vBuffer, width, height)
+                            uvPlanesAreNV21 = aliased
+                            Log.d(TAG, "Chroma planes NV21-aliased: $aliased")
+                        }
+                        bulkChroma = aliased
+                    }
+                    if (bulkChroma) {
+                        // The V and U planes alias one interleaved VU buffer
+                        // (verified above), so a single bulk copy of the V
+                        // plane IS the NV21 chroma sequence — bar the final U
+                        // byte, which the V plane's view doesn't cover; patch
+                        // it from U.
+                        vBuffer.position(0)
+                        val vSize = minOf(vBuffer.remaining(), nv21Size - pos)
+                        vBuffer.get(nv21, pos, vSize)
+                        pos += vSize
+                        if (pos < nv21Size && uBuffer.limit() > 0) {
+                            nv21[pos] = uBuffer.get(uBuffer.limit() - 1)
+                        }
+                    } else {
+                        // Rare layouts (padded rows / planar chroma): bulk-copy
+                        // each chroma row into reused arrays and interleave
+                        // from plain byte[]. Per-pixel ByteBuffer.get() here
+                        // was ~460k bounds-checked reads per frame.
+                        val chromaWidth = width / 2
+                        val chromaHeight = height / 2
+                        val rowLen = (chromaWidth - 1) * uvPixelStride + 1
+                        var rowV = uvRowV
+                        var rowU = uvRowU
+                        if (rowV == null || rowV.size < rowLen) {
+                            rowV = ByteArray(rowLen)
+                            uvRowV = rowV
+                        }
+                        if (rowU == null || rowU.size < rowLen) {
+                            rowU = ByteArray(rowLen)
+                            uvRowU = rowU
+                        }
+                        for (row in 0 until chromaHeight) {
+                            val base = row * uvRowStride
+                            vBuffer.position(base)
+                            vBuffer.get(rowV, 0, minOf(rowLen, vBuffer.limit() - base))
+                            uBuffer.position(base)
+                            uBuffer.get(rowU, 0, minOf(rowLen, uBuffer.limit() - base))
+                            var i = 0
+                            for (col in 0 until chromaWidth) {
+                                nv21[pos++] = rowV[i]
+                                nv21[pos++] = rowU[i]
+                                i += uvPixelStride
+                            }
+                        }
+                    }
+
+                    var bufs = ingestBuffers
+                    if (bufs == null || bufs[0].capacity() != nv21Size) {
+                        bufs = arrayOf(
+                            ByteBuffer.allocateDirect(nv21Size),
+                            ByteBuffer.allocateDirect(nv21Size)
                         )
-                    } catch (e: Exception) {
-                        Log.w(TAG, "receiveFrame error: ${e.message}")
+                        ingestBuffers = bufs
                     }
+                    val frameBuffer = bufs[ingestBufferIndex]
+                    ingestBufferIndex = (ingestBufferIndex + 1) % 2
+                    frameBuffer.clear()
+                    frameBuffer.put(nv21)
+                    frameBuffer.rewind()
+
+                    val rotation = if (front) 270 else 90
+                    // DeepAR is single-threaded: receiveFrame MUST run on the thread
+                    // DeepAR was initialized on (the main thread). Only the heavy
+                    // YUV->NV21 conversion above runs on the background camera thread.
+                    posted = mainHandler.post {
+                        try {
+                            if (isCapturing) {
+                                deepAR?.receiveFrame(
+                                    frameBuffer,
+                                    width, height,
+                                    rotation,
+                                    front,
+                                    DeepARImageFormat.YUV_420_888,
+                                    width
+                                )
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "receiveFrame error: ${e.message}")
+                        } finally {
+                            ingestInFlight.set(false)
+                        }
+                    }
+                } finally {
+                    if (!posted) ingestInFlight.set(false)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Frame processing error: ${e.message}")
@@ -558,6 +675,32 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
     }
 
+    // MLKit-style aliasing check: advance V by one byte and chop U's last
+    // byte — if the two views then compare equal, they alias one
+    // VU-interleaved buffer and the NV21 bulk chroma copy is valid. On
+    // NV12-ordered or truly planar layouts this returns false and the exact
+    // interleave fallback is used instead. Runs once per camera session.
+    private fun checkUvPlanesAreNV21(
+        uBuffer: ByteBuffer,
+        vBuffer: ByteBuffer,
+        width: Int,
+        height: Int
+    ): Boolean {
+        val vPos = vBuffer.position()
+        val uLimit = uBuffer.limit()
+        return try {
+            vBuffer.position(vPos + 1)
+            uBuffer.limit(uLimit - 1)
+            vBuffer.remaining() == (width * height / 2 - 2) &&
+                vBuffer.compareTo(uBuffer) == 0
+        } catch (e: Exception) {
+            false
+        } finally {
+            vBuffer.position(vPos)
+            uBuffer.limit(uLimit)
+        }
+    }
+
     private fun getCameraId(front: Boolean): String? {
         val manager = cameraManager ?: return null
         val facing = if (front) CameraCharacteristics.LENS_FACING_FRONT
@@ -581,25 +724,36 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         if (!isCapturing) return
         val sink = frameEventSink ?: return
+        // Drop the frame if the previous one is still queued for serialization
+        // on the main thread — queueing multi-MB payloads faster than the
+        // channel drains them only grows latency and heap.
+        if (!sendInFlight.compareAndSet(false, true)) return
 
+        var posted = false
         try {
             val width = image.width
             val height = image.height
             val plane = image.planes[0]
             val rowStride = plane.rowStride
             val pixelStride = plane.pixelStride
-
-            // Handle row padding: rowStride may be larger than width * pixelStride
             val buffer = plane.buffer
-            val pixelData: ByteArray
+            val size = width * height * pixelStride
+
+            // Reused output buffer. Safe because sink.success() serializes the
+            // payload synchronously before the send gate reopens, so the array
+            // is never overwritten while the channel still reads it.
+            var pixelData = rgbaBytes
+            if (pixelData == null || pixelData.size != size) {
+                pixelData = ByteArray(size)
+                rgbaBytes = pixelData
+            }
 
             if (rowStride == width * pixelStride) {
-                // No padding — fast path
-                pixelData = ByteArray(buffer.remaining())
-                buffer.get(pixelData)
+                // No padding — single bulk copy
+                buffer.position(0)
+                buffer.get(pixelData, 0, minOf(size, buffer.remaining()))
             } else {
                 // Has row padding — copy row by row
-                pixelData = ByteArray(width * height * pixelStride)
                 for (row in 0 until height) {
                     buffer.position(row * rowStride)
                     buffer.get(pixelData, row * width * pixelStride, width * pixelStride)
@@ -617,15 +771,19 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 Log.d(TAG, "Frame #$nativeFrameCount: ${width}x${height}, stride=$rowStride")
             }
 
-            mainHandler.post {
+            posted = mainHandler.post {
                 try {
                     sink.success(frameMap)
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to send frame to Flutter: ${e.message}")
+                } finally {
+                    sendInFlight.set(false)
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Error extracting frame data: ${e.message}")
+        } finally {
+            if (!posted) sendInFlight.set(false)
         }
     }
 }

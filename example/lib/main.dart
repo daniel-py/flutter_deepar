@@ -112,7 +112,7 @@ class _DeepARExamplePageState extends State<DeepARExamplePage> {
                     const SizedBox(height: 8),
                     _statusRow('Initialized', _isInitialized),
                     _statusRow('Capturing', _isCapturing),
-                    _statusRow('Effect', false, label: _currentEffect),
+                    _statusRow('Effect', false, label2: _currentEffect),
                     const SizedBox(height: 8),
                     Text(_frameInfo,
                         style: Theme.of(context).textTheme.bodySmall),
