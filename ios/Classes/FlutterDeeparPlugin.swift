@@ -82,7 +82,8 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
             let outputHeight = args["outputHeight"] as? Int ?? 1280
             initializeDeepAR(licenseKey: licenseKey, outputWidth: outputWidth, outputHeight: outputHeight, result: result)
         case "startCapture":
-            startCapture(result: result)
+            let front = (call.arguments as? [String: Any])?["front"] as? Bool
+            startCapture(front: front, result: result)
         case "stopCapture":
             stopCapture(result: result)
         case "loadEffect":
@@ -139,8 +140,12 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
     //  Start/Stop Capture
     // ──────────────────────────────────────────────────────────────────────
 
-    private func startCapture(result: @escaping FlutterResult) {
-        NSLog("[FlutterDeepAR] Starting capture...")
+    private func startCapture(front: Bool?, result: @escaping FlutterResult) {
+        // Explicit facing request (nil = keep current facing, e.g. on
+        // app-lifecycle resume) so new sessions never inherit a previous
+        // session's camera facing.
+        if let front = front { isFrontCamera = front }
+        NSLog("[FlutterDeepAR] Starting capture (front=\(isFrontCamera))...")
         isCapturing = true
         nativeFrameCount = 0
         setupCameraSession(useFront: isFrontCamera)
@@ -199,7 +204,8 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
             }
         }
         NSLog("[FlutterDeepAR] Camera switched to \(isFrontCamera ? "FRONT" : "BACK")")
-        result(true)
+        // Return the resulting facing so Dart can mirror real state.
+        result(isFrontCamera)
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -218,6 +224,8 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
         deepAR = nil
         isSdkInitialized = false
         pendingInitResult = nil
+        // A destroyed engine means a fresh default facing (matches Android).
+        isFrontCamera = true
         NSLog("[FlutterDeepAR] Pipeline destroyed")
         result(true)
     }

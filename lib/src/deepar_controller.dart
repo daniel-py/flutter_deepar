@@ -63,9 +63,16 @@ class DeepARController {
 
   /// Start camera capture and begin receiving processed frames via [frameStream].
   ///
-  /// The camera opens in front-facing mode by default. Use [switchCamera]
-  /// to toggle between front and back.
-  Future<void> startCapture() async {
+  /// [front] explicitly selects the camera facing: `true` opens the front
+  /// camera, `false` the back camera, and `null` (default) keeps whatever
+  /// facing the plugin last used. Pass an explicit value at session starts
+  /// that must not inherit a previous session's facing (e.g. `front: true`
+  /// so every new live stream begins on the selfie camera), and leave it
+  /// `null` for mid-session restarts like app-lifecycle resume.
+  ///
+  /// Requires flutter_deepar >= 0.1.8 native code for [front] to take
+  /// effect; older natives ignore unknown arguments.
+  Future<void> startCapture({bool? front}) async {
     _frameSub?.cancel();
     _frameSub = _frameChannel.receiveBroadcastStream().listen(
       (event) {
@@ -75,7 +82,7 @@ class DeepARController {
       },
       onError: (e) => _frameController.addError(e),
     );
-    await _channel.invokeMethod('startCapture');
+    await _channel.invokeMethod('startCapture', {'front': front});
   }
 
   /// Stop camera capture and frame delivery.
@@ -101,8 +108,17 @@ class DeepARController {
   Future<void> clearEffect() => loadEffect(null);
 
   /// Switch between front and back camera.
-  Future<void> switchCamera() async {
-    await _channel.invokeMethod('switchCamera');
+  ///
+  /// Returns the resulting facing (`true` = front camera) so callers can
+  /// mirror real state instead of blind-toggling their own flag. On Android
+  /// (>= 0.1.8) the value is committed only after the new camera session
+  /// actually configures; on iOS it reflects the requested facing (the
+  /// session rebuild completes asynchronously). With pre-0.1.8 native code
+  /// the returned value is always `true` regardless of facing — treat it as
+  /// authoritative only on >= 0.1.8 natives.
+  Future<bool?> switchCamera() async {
+    final result = await _channel.invokeMethod('switchCamera');
+    return result is bool ? result : null;
   }
 
   /// Fully release all DeepAR resources.

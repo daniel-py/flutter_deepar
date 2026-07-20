@@ -64,6 +64,20 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     private var nativeFrameCount = 0
     private var isFrontCamera = true
 
+    // The rotation/mirror pair passed to receiveFrame is LOCKED to the values
+    // of the first camera session of this DeepAR instance's lifetime and never
+    // changed again. DeepAR's offscreen pipeline keys itself to the input
+    // orientation it first sees; flipping the rotation argument 270<->90 on a
+    // live instance (the old switchCamera behaviour) makes frameAvailable stop
+    // firing permanently — the switched-to camera froze on its last frame on
+    // every Android device. Frames from the lens the session did NOT start on
+    // are instead mirrored in the NV21 buffer itself (see flipNV21Horizontal),
+    // which composes with the locked rotation+mirror to reproduce exactly the
+    // per-lens output the engine would have produced with per-lens parameters.
+    // -1 = not yet latched. Reset only when the engine is destroyed.
+    @Volatile private var lockedRotation = -1
+    @Volatile private var lockedMirror = false
+
     // Dedicated background thread for camera capture + frame conversion.
     // All Camera2 callbacks and the heavy YUV->NV21 conversion run here so the
     // main/UI thread stays free to composite the host's preview surface. Running
@@ -93,18 +107,26 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     private var uvRowV: ByteArray? = null
     private var uvRowU: ByteArray? = null
 
-    // Whether this camera session's U/V planes alias one NV21-ordered (VU)
-    // interleaved buffer, making the bulk chroma copy valid. Checked once per
-    // session (the layout is fixed per device+session); null = not yet checked.
-    // @Volatile because it is reset on the main thread (openCamera) and used
-    // on the camera thread.
-    @Volatile private var uvPlanesAreNV21: Boolean? = null
 
-    // Camera2 API
-    private var cameraDevice: CameraDevice? = null
-    private var captureSession: CameraCaptureSession? = null
-    private var imageReader: ImageReader? = null
+    // Camera2 API. @Volatile: written from the main thread (open/close paths)
+    // and read from the camera HandlerThread (session callbacks).
+    @Volatile private var cameraDevice: CameraDevice? = null
+    @Volatile private var captureSession: CameraCaptureSession? = null
+    @Volatile private var imageReader: ImageReader? = null
     private var cameraManager: CameraManager? = null
+
+    // Monotonic id for each openCamera() call. Camera2 callbacks capture the
+    // generation they were created under and are ignored if a newer open (or
+    // closeCamera) has since bumped it — a late onDisconnected/onError from an
+    // evicted OLD device must not clobber the NEW device's fields.
+    @Volatile private var cameraGeneration = 0
+
+    // Result of the startCapture/switchCamera call currently waiting for its
+    // camera session to actually configure. Completed (main thread only) from
+    // onConfigured / any failure path / a safety timeout, so the Dart side
+    // learns whether the camera really started instead of being told success
+    // before the async open even ran.
+    private var pendingCameraResult: MethodChannel.Result? = null
 
     // Camera sensor captures in landscape orientation (1280x720).
     // DeepAR rotates it 270° to portrait.
@@ -191,7 +213,7 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 outputHeight = call.argument<Int>("outputHeight") ?: 1280
                 initializeDeepAR(licenseKey, result)
             }
-            "startCapture" -> startCapture(result)
+            "startCapture" -> startCapture(call.argument<Boolean>("front"), result)
             "stopCapture" -> stopCapture(result)
             "loadEffect" -> {
                 val effectPath = call.argument<String>("effectPath") ?: ""
@@ -251,11 +273,11 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 override fun imageVisibilityChanged(gameObjectName: String?, visible: Boolean) {}
                 override fun frameAvailable(image: Image?) {
                     if (!isCapturing || image == null) return
-                    try {
-                        sendFrameToFlutter(image)
-                    } finally {
-                        image.close()
-                    }
+                    // Do NOT close the image: the SDK acquires it in a
+                    // try-with-resources and closes it itself right after this
+                    // callback returns (verified in 5.6.4 bytecode). Closing it
+                    // here too is a double-close.
+                    sendFrameToFlutter(image)
                 }
                 override fun error(errorType: ARErrorType?, message: String?) {
                     Log.e(TAG, "DeepAR error: $errorType — $message")
@@ -293,18 +315,84 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     //  Start camera capture + DeepAR rendering
     // ──────────────────────────────────────────────────────────────────────
 
-    private fun startCapture(result: MethodChannel.Result) {
+    private fun startCapture(front: Boolean?, result: MethodChannel.Result) {
+        // Explicit facing request (e.g. "every livestream starts on the
+        // front camera"). null = keep the current facing, so callers like
+        // app-lifecycle resume don't clobber the user's mid-stream choice.
+        if (front != null) isFrontCamera = front
+        Log.d(TAG, "startCapture: initialized=$isSdkInitialized front=$isFrontCamera (requested=$front)")
+        isCapturing = true
+        nativeFrameCount = 0
+        setPendingCameraResult(result)
         try {
-            Log.d(TAG, "startCapture: initialized=$isSdkInitialized")
-            isCapturing = true
-            nativeFrameCount = 0
             startCameraThread()
             openCamera(isFrontCamera)
-            result.success(true)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start capture: ${e.message}", e)
-            result.error("START_FAILED", e.message, null)
+            failPendingCameraResult("START_FAILED", e.message)
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  Pending camera result plumbing — all completions hop to the main
+    //  thread, where pendingCameraResult is exclusively touched, so a result
+    //  can never be completed twice.
+    // ──────────────────────────────────────────────────────────────────────
+
+    private fun setPendingCameraResult(result: MethodChannel.Result) {
+        // A previous pending call that never resolved (shouldn't happen, but
+        // never strand a Dart future) is failed before being replaced.
+        pendingCameraResult?.let {
+            Log.w(TAG, "Replacing unresolved camera result")
+            it.error("SUPERSEDED", "A newer camera call replaced this one", null)
+        }
+        pendingCameraResult = result
+        // Safety net: if the HAL never delivers any terminal callback, resolve
+        // with success anyway after 6s (mirrors the init timeout) so Dart
+        // can't hang forever. Identity check — only fires for THIS result.
+        mainHandler.postDelayed({
+            if (pendingCameraResult === result) {
+                Log.w(TAG, "Camera result timeout — resolving optimistically")
+                pendingCameraResult = null
+                result.success(isFrontCamera)
+            }
+        }, 6000)
+    }
+
+    /**
+     * Complete the pending result successfully, committing [front] as the new
+     * facing — but ONLY if [generation] is still the current camera session.
+     * The generation is re-checked on the main thread (the only thread that
+     * mutates it), which closes the race where a stale session's callback,
+     * already past its camera-thread generation check, would otherwise
+     * resolve a NEWER call's result. Facing is committed here, on success,
+     * so a failed switch can't desync isFrontCamera from the real camera.
+     */
+    private fun completePendingCameraResult(generation: Int, front: Boolean) {
+        mainHandler.post {
+            if (generation != cameraGeneration) return@post
+            isFrontCamera = front
+            pendingCameraResult?.success(front)
+            pendingCameraResult = null
+        }
+    }
+
+    /** Generation-guarded failure — for camera-thread callback paths. */
+    private fun failPendingCameraResult(generation: Int, code: String, message: String?) {
+        mainHandler.post {
+            if (generation != cameraGeneration) return@post
+            pendingCameraResult?.error(code, message, null)
+            pendingCameraResult = null
+        }
+    }
+
+    /** Unconditional failure. MAIN THREAD callers only (method-channel
+     *  handlers and mainHandler lambdas) — completes the current pending
+     *  result directly, no post, no generation check. */
+    private fun failPendingCameraResult(code: String, message: String?) {
+        val result = pendingCameraResult
+        pendingCameraResult = null
+        result?.error(code, message, null)
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -315,6 +403,8 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         try {
             Log.d(TAG, "Stopping capture...")
             isCapturing = false
+            // A start/switch still waiting on its session must not dangle.
+            failPendingCameraResult("STOPPED", "Capture stopped before camera session configured")
             closeCamera()
             stopCameraThread()
             Log.d(TAG, "Capture stopped")
@@ -350,15 +440,19 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     // ──────────────────────────────────────────────────────────────────────
 
     private fun switchCamera(result: MethodChannel.Result) {
+        // Target facing is NOT committed to isFrontCamera here — it is
+        // committed in completePendingCameraResult once the new session
+        // actually configures, so a failed switch leaves the plugin's facing
+        // state matching the camera that is really still running.
+        val target = !isFrontCamera
+        Log.d(TAG, "Switching camera to ${if (target) "FRONT" else "BACK"}")
+        setPendingCameraResult(result)
         try {
-            isFrontCamera = !isFrontCamera
             closeCamera()
-            openCamera(isFrontCamera)
-            Log.d(TAG, "Camera switched to ${if (isFrontCamera) "FRONT" else "BACK"}")
-            result.success(true)
+            openCamera(target)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to switch camera: ${e.message}", e)
-            result.error("SWITCH_FAILED", e.message, null)
+            failPendingCameraResult("SWITCH_FAILED", e.message)
         }
     }
 
@@ -380,6 +474,7 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private fun cleanup() {
         isCapturing = false
+        failPendingCameraResult("DESTROYED", "DeepAR pipeline destroyed")
         closeCamera()
         stopCameraThread()
         try {
@@ -392,6 +487,11 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         nativeFrameCount = 0
         frameEventSink = null
         pendingInitResult = null
+        // The engine is gone — the next instance latches fresh values, and a
+        // fresh instance means a fresh default facing too.
+        lockedRotation = -1
+        lockedMirror = false
+        isFrontCamera = true
         ingestInFlight.set(false)
         sendInFlight.set(false)
         nv21Bytes = null
@@ -423,24 +523,65 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         cameraHandler = null
     }
 
-    private fun openCamera(front: Boolean) {
-        val manager = cameraManager ?: return
+    private fun openCamera(front: Boolean, isRetry: Boolean = false) {
+        val manager = cameraManager ?: run {
+            failPendingCameraResult("NO_MANAGER", "CameraManager unavailable")
+            return
+        }
         // Ensure the background thread exists (e.g. if openCamera is reached
         // via switchCamera without a fresh startCapture).
         if (cameraHandler == null) startCameraThread()
-        val camHandler = cameraHandler ?: return
-        val cameraId = getCameraId(front) ?: return
-        val ctx = activity ?: applicationContext ?: return
+        val camHandler = cameraHandler ?: run {
+            failPendingCameraResult("NO_THREAD", "Camera thread unavailable")
+            return
+        }
+        val cameraId = getCameraId(front) ?: run {
+            failPendingCameraResult("NO_CAMERA", "No ${if (front) "front" else "back"} camera on this device")
+            return
+        }
+        val ctx = activity ?: applicationContext ?: run {
+            failPendingCameraResult("NO_CONTEXT", "No context available")
+            return
+        }
 
         if (ActivityCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA)
             != PackageManager.PERMISSION_GRANTED
         ) {
             Log.e(TAG, "Camera permission not granted")
+            failPendingCameraResult("NO_PERMISSION", "Camera permission not granted")
             return
         }
 
-        // New session — the chroma layout must be re-checked on its first frame.
-        uvPlanesAreNV21 = null
+        // This open supersedes every outstanding camera callback.
+        val myGeneration = ++cameraGeneration
+
+        // Latch the engine-lifetime rotation/mirror on the first session (see
+        // the lockedRotation field docs for why they can never change again).
+        if (lockedRotation == -1) {
+            lockedRotation = if (front) 270 else 90
+            lockedMirror = front
+            Log.d(TAG, "DeepAR input params latched: rotation=$lockedRotation mirror=$lockedMirror")
+        }
+        // Frames from the lens the engine was NOT latched to are mirrored in
+        // the buffer instead; composed with the locked rotation+mirror this
+        // yields exactly the upright/mirroring output each lens always had.
+        val flipInBuffer = (if (front) 270 else 90) != lockedRotation
+        Log.d(TAG, "openCamera gen=$myGeneration front=$front flipInBuffer=$flipInBuffer retry=$isRetry")
+
+        // Close any reader left from a previous open that never went through
+        // closeCamera (e.g. a failed open being retried) — otherwise its
+        // native buffers leak until the GC finalizer runs.
+        try {
+            imageReader?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing stale image reader: ${e.message}")
+        }
+
+        // Per-session chroma-layout check result. Closure-local so a stale
+        // in-flight frame from the PREVIOUS session (still finishing on the
+        // camera thread) can never pre-populate the NEW session's check.
+        // Only touched on the camera thread — no synchronization needed.
+        var uvAliasedForSession: Boolean? = null
 
         // ImageReader with 4 buffers to prevent "Unable to acquire buffer" warnings
         imageReader = ImageReader.newInstance(
@@ -507,10 +648,10 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     // Chroma → NV21 (VU interleaved)
                     var bulkChroma = false
                     if (uvPixelStride == 2 && uvRowStride == width) {
-                        var aliased = uvPlanesAreNV21
+                        var aliased = uvAliasedForSession
                         if (aliased == null) {
                             aliased = checkUvPlanesAreNV21(uBuffer, vBuffer, width, height)
-                            uvPlanesAreNV21 = aliased
+                            uvAliasedForSession = aliased
                             Log.d(TAG, "Chroma planes NV21-aliased: $aliased")
                         }
                         bulkChroma = aliased
@@ -561,6 +702,10 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         }
                     }
 
+                    // Non-latched lens: mirror the frame in-buffer so the
+                    // rotation/mirror arguments below can stay locked.
+                    if (flipInBuffer) flipNV21Horizontal(nv21, width, height)
+
                     var bufs = ingestBuffers
                     if (bufs == null || bufs[0].capacity() != nv21Size) {
                         bufs = arrayOf(
@@ -575,18 +720,19 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     frameBuffer.put(nv21)
                     frameBuffer.rewind()
 
-                    val rotation = if (front) 270 else 90
                     // DeepAR is single-threaded: receiveFrame MUST run on the thread
                     // DeepAR was initialized on (the main thread). Only the heavy
                     // YUV->NV21 conversion above runs on the background camera thread.
+                    // rotation/mirror are the engine-lifetime locked values — NEVER
+                    // the current lens's natural ones (see lockedRotation docs).
                     posted = mainHandler.post {
                         try {
                             if (isCapturing) {
                                 deepAR?.receiveFrame(
                                     frameBuffer,
                                     width, height,
-                                    rotation,
-                                    front,
+                                    lockedRotation,
+                                    lockedMirror,
                                     DeepARImageFormat.YUV_420_888,
                                     width
                                 )
@@ -609,24 +755,65 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
-                Log.d(TAG, "Camera opened: $cameraId")
+                if (myGeneration != cameraGeneration) {
+                    // A newer open/close superseded this session while the HAL
+                    // was still opening it — release it, don't touch fields.
+                    Log.d(TAG, "Stale onOpened (gen=$myGeneration), closing")
+                    camera.close()
+                    return
+                }
+                Log.d(TAG, "Camera opened: $cameraId (gen=$myGeneration)")
                 cameraDevice = camera
-                startCameraPreview()
+                startCameraPreview(myGeneration, front)
             }
             override fun onDisconnected(camera: CameraDevice) {
-                Log.d(TAG, "Camera disconnected")
                 camera.close()
+                if (myGeneration != cameraGeneration) return
+                Log.w(TAG, "Camera disconnected (gen=$myGeneration)")
                 cameraDevice = null
+                handleCameraFailure(myGeneration, front, isRetry, "disconnected")
             }
             override fun onError(camera: CameraDevice, error: Int) {
-                Log.e(TAG, "Camera error: $error")
                 camera.close()
+                if (myGeneration != cameraGeneration) return
+                Log.e(TAG, "Camera error: $error (gen=$myGeneration)")
                 cameraDevice = null
+                handleCameraFailure(myGeneration, front, isRetry, "error $error")
             }
         }, camHandler)
     }
 
-    private fun startCameraPreview() {
+    // One retry with a short delay covers transient open failures (e.g. the
+    // previous device's HAL teardown still in flight); a second failure is
+    // surfaced to Dart instead of leaving a silently frozen preview.
+    // Runs on the CAMERA thread (device state callbacks) — result completion
+    // must go through the generation-guarded overloads.
+    private fun handleCameraFailure(generation: Int, front: Boolean, wasRetry: Boolean, why: String) {
+        if (!wasRetry) {
+            Log.w(TAG, "Camera $why (gen=$generation) — retrying in 300ms")
+            mainHandler.postDelayed({
+                if (generation == cameraGeneration && isCapturing) {
+                    try {
+                        openCamera(front, isRetry = true)
+                    } catch (e: Exception) {
+                        // openCamera throws CameraAccessException when the
+                        // camera service itself is down — exactly when retries
+                        // fire. Uncaught here it would crash the main looper.
+                        Log.e(TAG, "Camera retry failed: ${e.message}", e)
+                        failPendingCameraResult("CAMERA_FAILED", e.message)
+                    }
+                }
+            }, 300)
+        } else {
+            Log.e(TAG, "Camera $why after retry — giving up")
+            failPendingCameraResult(generation, "CAMERA_FAILED", "Camera $why")
+        }
+    }
+
+    // Runs on the CAMERA thread — result completion must go through the
+    // generation-guarded overloads (re-checked on the main thread).
+    private fun startCameraPreview(generation: Int, front: Boolean) {
+        if (generation != cameraGeneration) return
         val camera = cameraDevice ?: return
         val reader = imageReader ?: return
         val camHandler = cameraHandler ?: mainHandler
@@ -643,7 +830,12 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 listOf(reader.surface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
-                        Log.d(TAG, "Camera capture session configured")
+                        if (generation != cameraGeneration) {
+                            Log.d(TAG, "Stale onConfigured (gen=$generation), closing")
+                            try { session.close() } catch (_: Exception) {}
+                            return
+                        }
+                        Log.d(TAG, "Camera capture session configured (gen=$generation)")
                         captureSession = session
                         try {
                             session.setRepeatingRequest(
@@ -651,31 +843,82 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                                 null,
                                 camHandler
                             )
+                            completePendingCameraResult(generation, front)
                         } catch (e: Exception) {
                             Log.e(TAG, "Failed to start repeating request: ${e.message}")
+                            failPendingCameraResult(generation, "SESSION_FAILED", e.message)
                         }
                     }
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        Log.e(TAG, "Camera capture session configuration failed")
+                        Log.e(TAG, "Camera capture session configuration failed (gen=$generation)")
+                        failPendingCameraResult(generation, "CONFIGURE_FAILED", "Capture session configuration failed")
                     }
                 },
                 camHandler
             )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create camera preview: ${e.message}", e)
+            failPendingCameraResult(generation, "PREVIEW_FAILED", e.message)
         }
     }
 
     private fun closeCamera() {
+        // Invalidate every outstanding callback from the session being closed
+        // BEFORE closing, so late onDisconnected/onError can't clobber the
+        // fields of whatever session comes next.
+        ++cameraGeneration
         try {
             captureSession?.close()
-            captureSession = null
-            cameraDevice?.close()
-            cameraDevice = null
-            imageReader?.close()
-            imageReader = null
         } catch (e: Exception) {
-            Log.w(TAG, "Error closing camera: ${e.message}")
+            Log.w(TAG, "Error closing capture session: ${e.message}")
+        }
+        captureSession = null
+        try {
+            cameraDevice?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing camera device: ${e.message}")
+        }
+        cameraDevice = null
+        try {
+            imageReader?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing image reader: ${e.message}")
+        }
+        imageReader = null
+    }
+
+    /**
+     * Horizontally mirrors an NV21 frame in place (sensor-space flip).
+     *
+     * Y plane: each row's bytes are reversed. Chroma plane: each row's VU
+     * PAIRS are reversed while V stays before U inside every pair. Row-local
+     * swaps only — cache friendly, ~n/2 element swaps on the reused array,
+     * cheap next to the YUV->NV21 conversion that precedes it.
+     */
+    private fun flipNV21Horizontal(nv21: ByteArray, width: Int, height: Int) {
+        // Y plane
+        var rowStart = 0
+        for (row in 0 until height) {
+            var i = rowStart
+            var j = rowStart + width - 1
+            while (i < j) {
+                val t = nv21[i]; nv21[i] = nv21[j]; nv21[j] = t
+                i++; j--
+            }
+            rowStart += width
+        }
+        // Interleaved VU plane: width bytes per row = width/2 pairs
+        var base = width * height
+        for (row in 0 until height / 2) {
+            var i = base
+            var j = base + width - 2
+            while (i < j) {
+                val v = nv21[i]; val u = nv21[i + 1]
+                nv21[i] = nv21[j]; nv21[i + 1] = nv21[j + 1]
+                nv21[j] = v; nv21[j + 1] = u
+                i += 2; j -= 2
+            }
+            base += width
         }
     }
 
