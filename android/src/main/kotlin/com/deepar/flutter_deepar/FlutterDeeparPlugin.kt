@@ -426,7 +426,15 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 deepAR?.switchEffect("effect", null as String?)
             } else {
                 Log.d(TAG, "Loading effect: $effectPath")
-                deepAR?.switchEffect("effect", "file:///android_asset/$effectPath")
+                // Absolute filesystem paths (e.g. effects downloaded at
+                // runtime) load as plain file:// URIs; relative paths keep
+                // resolving from the bundled android assets.
+                val uri = if (effectPath.startsWith("/")) {
+                    "file://$effectPath"
+                } else {
+                    "file:///android_asset/$effectPath"
+                }
+                deepAR?.switchEffect("effect", uri)
             }
             result.success(true)
         } catch (e: Exception) {

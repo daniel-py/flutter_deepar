@@ -171,6 +171,10 @@ public class FlutterDeeparPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
         if effectPath.isEmpty || effectPath == "None" {
             NSLog("[FlutterDeepAR] Clearing effect")
             deepAR?.switchEffect(withSlot: "effect", path: nil)
+        } else if effectPath.hasPrefix("/") {
+            // Absolute filesystem path (e.g. an effect downloaded at runtime)
+            NSLog("[FlutterDeepAR] Loading effect from file: \(effectPath)")
+            deepAR?.switchEffect(withSlot: "effect", path: effectPath)
         } else {
             NSLog("[FlutterDeepAR] Loading effect: \(effectPath)")
             // effectPath is like "effects/filter_name.deepar" — resolve from main bundle

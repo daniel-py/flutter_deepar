@@ -1,3 +1,7 @@
+## 0.1.9
+
+* Feature: `loadEffect` accepts absolute filesystem paths on both platforms (any path starting with `/`), so effects downloaded at runtime load exactly like bundled ones. Relative paths keep resolving from the app's bundled assets (`android_asset` / main bundle) — fully backward compatible.
+
 ## 0.1.8
 
 * Fix (Android): switching cameras mid-session no longer freezes the preview/stream on a single frame. DeepAR's offscreen pipeline keys itself to the input orientation of the first frame it receives; the plugin used to flip the `receiveFrame` rotation argument between 270 (front) and 90 (back) on switch, after which `frameAvailable` stopped firing for the switched-to camera on every Android device. The rotation/mirror arguments are now latched for the engine's lifetime, and frames from the non-initial lens are horizontally mirrored inside the NV21 buffer instead — which composes with the latched arguments to produce exactly the per-lens upright/mirroring output as before. iOS never had the bug (its capture connection is locked to portrait) and is unchanged.

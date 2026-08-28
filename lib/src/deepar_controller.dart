@@ -94,8 +94,10 @@ class DeepARController {
 
   /// Load an AR effect file.
   ///
-  /// [effectPath] should be relative to your app's assets folder,
-  /// e.g. `'effects/burning_effect.deepar'`.
+  /// [effectPath] is either relative to your app's assets folder
+  /// (e.g. `'effects/burning_effect.deepar'`) or, since 0.1.9, an absolute
+  /// filesystem path (starting with `/`) — e.g. an effect downloaded at
+  /// runtime.
   ///
   /// Pass `null` or `'None'` to clear the current effect.
   Future<void> loadEffect(String? effectPath) async {
