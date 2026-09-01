@@ -1,3 +1,7 @@
+## 0.1.10
+
+* Fix (Android): absolute-path effects (0.1.9's runtime-downloaded files) now actually apply. The DeepAR 5.6.4 String-path `switchEffect` resolves paths in native code and silently ignores everything except `android_asset` URIs — the `file:///data/...` form 0.1.9 produced loaded nothing, with no error. Absolute paths now go through the SDK's `InputStream` overload, which reads the file bytes in Java (verified synchronous against the SDK bytecode), so a good file always applies and a bad one fails loudly instead of silently. iOS was never affected (its SDK takes filesystem paths directly) and is unchanged.
+
 ## 0.1.9
 
 * Feature: `loadEffect` accepts absolute filesystem paths on both platforms (any path starting with `/`), so effects downloaded at runtime load exactly like bundled ones. Relative paths keep resolving from the app's bundled assets (`android_asset` / main bundle) — fully backward compatible.

@@ -3,7 +3,7 @@ description: >
   Flutter plugin for the DeepAR augmented reality SDK. Provides camera capture,
   AR effect loading/switching, and a stream of AR-processed frames (RGBA/BGRA)
   for use in live streaming, recording, or preview.
-version: 0.1.9
+version: 0.1.10
 homepage: https://github.com/daniel-py/flutter_deepar
 repository: https://github.com/daniel-py/flutter_deepar
 

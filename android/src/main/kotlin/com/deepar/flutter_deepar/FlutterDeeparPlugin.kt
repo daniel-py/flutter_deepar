@@ -424,17 +424,21 @@ class FlutterDeeparPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             if (effectPath.isEmpty() || effectPath == "None") {
                 Log.d(TAG, "Clearing effect")
                 deepAR?.switchEffect("effect", null as String?)
+            } else if (effectPath.startsWith("/")) {
+                // Absolute filesystem paths (effects downloaded at runtime).
+                // The String overload resolves paths in NATIVE code and
+                // silently no-ops on anything but android_asset URIs — the
+                // InputStream overload instead reads the bytes here in Java
+                // (synchronously, verified against the SDK bytecode:
+                // stream -> byte[] -> switchEffectRawNative), so a bad file
+                // throws visibly and a good one always applies.
+                Log.d(TAG, "Loading effect from file: $effectPath")
+                java.io.FileInputStream(effectPath).use { stream ->
+                    deepAR?.switchEffect("effect", stream)
+                }
             } else {
                 Log.d(TAG, "Loading effect: $effectPath")
-                // Absolute filesystem paths (e.g. effects downloaded at
-                // runtime) load as plain file:// URIs; relative paths keep
-                // resolving from the bundled android assets.
-                val uri = if (effectPath.startsWith("/")) {
-                    "file://$effectPath"
-                } else {
-                    "file:///android_asset/$effectPath"
-                }
-                deepAR?.switchEffect("effect", uri)
+                deepAR?.switchEffect("effect", "file:///android_asset/$effectPath")
             }
             result.success(true)
         } catch (e: Exception) {
